@@ -1,0 +1,43 @@
+#!/bin/sh
+# Remove as extensoes que o postinst copiou para o diretorio do sistema e, se
+# possivel, tira-as da lista de extensoes ativadas do utilizador.
+set -e
+
+SYS_EXT=/usr/share/gnome-shell/extensions
+CLAUDE_UUID="claude-usage@local"
+CODEX_UUID="codex-usage@local"
+
+case "$1" in
+  remove|purge|disappear)
+    rm -rf "$SYS_EXT/$CLAUDE_UUID" "$SYS_EXT/$CODEX_UUID"
+
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+      uid="$(id -u "$SUDO_USER" 2>/dev/null || echo)"
+      if [ -n "$uid" ] && [ -S "/run/user/$uid/bus" ]; then
+        sudo -u "$SUDO_USER" \
+          DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+          python3 - "$CLAUDE_UUID" "$CODEX_UUID" >/dev/null 2>&1 <<'PY' || true
+import ast, subprocess, sys
+remove = sys.argv[1:]
+try:
+    out = subprocess.check_output(
+        ['gsettings', 'get', 'org.gnome.shell', 'enabled-extensions']).decode().strip()
+    cur = ast.literal_eval(out.replace('@as ', '')) if out and out != '@as []' else []
+except Exception:
+    cur = []
+new = [x for x in cur if x not in remove]
+if new != cur:
+    val = '[' + ', '.join("'%s'" % x for x in new) + ']'
+    subprocess.check_call(['gsettings', 'set', 'org.gnome.shell', 'enabled-extensions', val])
+PY
+      fi
+    fi
+    ;;
+esac
+
+if [ "$1" = "purge" ] && [ -e /usr/share/debconf/confmodule ]; then
+  . /usr/share/debconf/confmodule
+  db_purge || true
+fi
+
+exit 0

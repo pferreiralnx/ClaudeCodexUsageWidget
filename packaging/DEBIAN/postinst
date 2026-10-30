@@ -1,0 +1,91 @@
+#!/bin/sh
+# Instala, a partir da area de staging em /usr/share/claude-codex-usage, apenas
+# as extensoes escolhidas pela pergunta do debconf, copiando-as para o diretorio
+# de extensoes do GNOME Shell de todo o sistema. Depois tenta ativa-las para o
+# utilizador que correu o sudo (em Wayland so aparecem apos terminar e reiniciar
+# a sessao).
+set -e
+. /usr/share/debconf/confmodule
+
+STAGE=/usr/share/claude-codex-usage
+SYS_EXT=/usr/share/gnome-shell/extensions
+
+CLAUDE_UUID="claude-usage@local"
+CODEX_UUID="codex-usage@local"
+
+install_ext() {
+  uuid="$1"; src="$2"
+  rm -rf "$SYS_EXT/$uuid"
+  mkdir -p "$SYS_EXT"
+  cp -a "$src" "$SYS_EXT/$uuid"
+}
+
+remove_ext() {
+  rm -rf "$SYS_EXT/$1"
+}
+
+case "$1" in
+  configure)
+    # Com "dpkg -i" o script de config nao e corrido; perguntamos aqui tambem.
+    # Se o apt ja perguntou, o debconf marca como "seen" e nao volta a perguntar.
+    db_input high claude-codex-usage/extensions || true
+    db_go || true
+    db_get claude-codex-usage/extensions || true
+    SEL="$(echo "$RET" | tr -d ' ')"
+
+    want_claude=0
+    want_codex=0
+    case ",$SEL," in *,Claude,*) want_claude=1 ;; esac
+    case ",$SEL," in *,Codex,*)  want_codex=1  ;; esac
+
+    if [ "$want_claude" = 1 ]; then
+      install_ext "$CLAUDE_UUID" "$STAGE/claude-usage-extension"
+    else
+      remove_ext "$CLAUDE_UUID"
+    fi
+    if [ "$want_codex" = 1 ]; then
+      install_ext "$CODEX_UUID" "$STAGE/codex-usage-extension"
+    else
+      remove_ext "$CODEX_UUID"
+    fi
+
+    # Ativar para o utilizador que invocou o sudo (best-effort).
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+      uid="$(id -u "$SUDO_USER" 2>/dev/null || echo)"
+      if [ -n "$uid" ] && [ -S "/run/user/$uid/bus" ]; then
+        enable_list=""
+        disable_list=""
+        if [ "$want_claude" = 1 ]; then enable_list="$enable_list $CLAUDE_UUID"; else disable_list="$disable_list $CLAUDE_UUID"; fi
+        if [ "$want_codex" = 1 ];  then enable_list="$enable_list $CODEX_UUID";  else disable_list="$disable_list $CODEX_UUID";  fi
+
+        sudo -u "$SUDO_USER" \
+          DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+          python3 - "$enable_list" "--" "$disable_list" >/dev/null 2>&1 <<'PY' || true
+import ast, subprocess, sys
+args = sys.argv[1:]
+sep = args.index('--')
+enable = args[0].split()
+disable = args[sep + 1].split() if sep + 1 < len(args) else []
+try:
+    out = subprocess.check_output(
+        ['gsettings', 'get', 'org.gnome.shell', 'enabled-extensions']).decode().strip()
+    cur = ast.literal_eval(out.replace('@as ', '')) if out and out != '@as []' else []
+except Exception:
+    cur = []
+cur = [x for x in cur if x not in disable]
+for u in enable:
+    if u not in cur:
+        cur.append(u)
+val = '[' + ', '.join("'%s'" % x for x in cur) + ']'
+subprocess.check_call(['gsettings', 'set', 'org.gnome.shell', 'enabled-extensions', val])
+PY
+      fi
+    fi
+
+    echo
+    echo "Pronto. Em Wayland, termina a sessao e volta a entrar (ou reinicia) para"
+    echo "as barras aparecerem na barra de topo. Depois ficam sempre em cada login."
+    ;;
+esac
+
+exit 0

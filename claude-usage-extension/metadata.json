@@ -1,0 +1,7 @@
+{
+  "uuid": "claude-usage@local",
+  "name": "Claude Usage",
+  "description": "Barra de progresso do uso do Claude (Anthropic) no lado esquerdo da barra de topo. Mostra a sessão de 5h; ao clicar vê sessão, semanal e semanal Opus com tempo até ao reset.",
+  "shell-version": ["45", "46", "47", "48"],
+  "version": 1
+}

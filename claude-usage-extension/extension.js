@@ -1,0 +1,239 @@
+// Claude Usage — barra de progresso do uso do Claude (Anthropic) no lado ESQUERDO
+// da barra de topo do GNOME. Lê o token OAuth de ~/.claude/.credentials.json (só
+// leitura) e consulta https://api.anthropic.com/api/oauth/usage.
+//
+// Barra principal = sessão de 5h. O menu mostra sessão (5h), semanal e semanal
+// Opus, cada uma com a percentagem e o tempo até ao reset.
+
+import St from 'gi://St';
+import Gio from 'gi://Gio';
+import GObject from 'gi://GObject';
+import GLib from 'gi://GLib';
+import Clutter from 'gi://Clutter';
+import Soup from 'gi://Soup';
+
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
+import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
+import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
+
+const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
+const BETA_HEADER = 'oauth-2025-04-20';
+const CREDS_PATH = GLib.build_filenamev([GLib.get_home_dir(), '.claude', '.credentials.json']);
+const POLL_SECONDS = 90;
+const TRACK_WIDTH = 64;   // largura da barra em px
+const BAR_HEIGHT = 10;
+
+// Janelas de limite que mostramos, por ordem, com o título legível.
+const WINDOWS = [
+    ['five_hour', 'Sessão (5h)'],
+    ['seven_day', 'Semanal'],
+    ['seven_day_opus', 'Semanal Opus'],
+];
+
+function severityColor(pct) {
+    if (pct === null || pct === undefined) return '#9aa0a6';
+    if (pct >= 85) return '#e74c3c';
+    if (pct >= 50) return '#e67e22';
+    return '#2ecc71';
+}
+
+function bar(pct, cells = 6) {
+    pct = Math.max(0, Math.min(100, pct ?? 0));
+    const filled = Math.round((pct / 100) * cells);
+    return '▰'.repeat(filled) + '▱'.repeat(cells - filled);
+}
+
+function human(seconds) {
+    seconds = Math.max(0, Math.floor(seconds ?? 0));
+    const d = Math.floor(seconds / 86400);
+    const h = Math.floor((seconds % 86400) / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    if (d) return `${d}d ${h}h`;
+    if (h) return `${h}h ${m}m`;
+    return `${m}m`;
+}
+
+// O Claude devolve 'resets_at' como ISO 8601; convertemos no tempo que falta.
+function resetHuman(resetsAt) {
+    if (!resetsAt) return '—';
+    const when = GLib.DateTime.new_from_iso8601(resetsAt, null);
+    if (!when) return '—';
+    const secs = when.difference(GLib.DateTime.new_now_utc()) / 1e6; // µs → s
+    if (secs <= 0) return 'agora';
+    return human(secs);
+}
+
+const ClaudeIndicator = GObject.registerClass(
+class ClaudeIndicator extends PanelMenu.Button {
+    _init(extPath) {
+        super._init(0.0, 'Claude Usage', false);
+        this._destroyed = false;
+        this._session = new Soup.Session();
+        this._lastData = null;
+        this._lastError = null;
+
+        const box = new St.BoxLayout({
+            style_class: 'ai-usage-indicator',
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        this._logo = new St.Icon({
+            gicon: Gio.icon_new_for_string(`${extPath}/claude-logo.svg`),
+            style_class: 'ai-usage-logo',
+            icon_size: 18,
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        // Calha com posicionamento fixo: o preenchimento fica preso em (0,0) e
+        // cresce da esquerda para a direita (um St.Bin centrava-o).
+        this._track = new St.Widget({
+            style_class: 'ai-usage-track',
+            layout_manager: new Clutter.FixedLayout(),
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        this._track.set_size(TRACK_WIDTH, BAR_HEIGHT);
+        this._fill = new St.Widget({style_class: 'ai-usage-fill'});
+        this._fill.set_position(0, 0);
+        this._fill.set_size(0, BAR_HEIGHT);
+        this._track.add_child(this._fill);
+        this._pct = new St.Label({
+            text: '…',
+            style_class: 'ai-usage-pct',
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        box.add_child(this._logo);
+        box.add_child(this._track);
+        box.add_child(this._pct);
+        this.add_child(box);
+
+        // --- menu ---
+        this._header = new PopupMenu.PopupMenuItem('Uso do Claude', {reactive: false});
+        this._header.label.style = 'font-weight: bold;';
+        this.menu.addMenuItem(this._header);
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+
+        this._row5h = new PopupMenu.PopupMenuItem('', {reactive: false});
+        this._rowWeek = new PopupMenu.PopupMenuItem('', {reactive: false});
+        this._rowOpus = new PopupMenu.PopupMenuItem('', {reactive: false});
+        for (const r of [this._row5h, this._rowWeek, this._rowOpus])
+            r.label.style = 'font-family: monospace;';
+        this.menu.addMenuItem(this._row5h);
+        this.menu.addMenuItem(this._rowWeek);
+        this.menu.addMenuItem(this._rowOpus);
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+
+        const refresh = new PopupMenu.PopupMenuItem('Atualizar agora');
+        refresh.connect('activate', () => this.refresh());
+        this.menu.addMenuItem(refresh);
+
+        this.connect('destroy', () => { this._destroyed = true; });
+    }
+
+    refresh() {
+        let token;
+        try {
+            const [, bytes] = GLib.file_get_contents(CREDS_PATH);
+            const creds = JSON.parse(new TextDecoder().decode(bytes));
+            token = creds?.claudeAiOauth?.accessToken;
+            if (!token) throw new Error('sem token');
+        } catch (_e) {
+            this._lastData = null;
+            this._lastError = 'Sem credenciais — inicia sessão no Claude Code.';
+            this._render();
+            return;
+        }
+
+        const msg = Soup.Message.new('GET', USAGE_URL);
+        const h = msg.get_request_headers();
+        h.append('Authorization', `Bearer ${token}`);
+        h.append('Content-Type', 'application/json');
+        h.append('anthropic-beta', BETA_HEADER);
+        h.append('User-Agent', 'claude-usage-gnome/1.0');
+        h.append('Accept', 'application/json');
+
+        this._session.send_and_read_async(msg, GLib.PRIORITY_DEFAULT, null, (session, res) => {
+            if (this._destroyed) return;
+            try {
+                const b = session.send_and_read_finish(res);
+                const status = msg.get_status();
+                if (status !== Soup.Status.OK) {
+                    this._lastData = null;
+                    this._lastError = (status === 401 || status === 403)
+                        ? 'Sessão expirada — reautentica no Claude Code.'
+                        : `Erro HTTP ${status}`;
+                    this._render();
+                    return;
+                }
+                this._lastData = JSON.parse(new TextDecoder().decode(b.get_data()));
+                this._lastError = null;
+                this._render();
+            } catch (e) {
+                this._lastData = null;
+                this._lastError = `Falha: ${e.message}`;
+                this._render();
+            }
+        });
+    }
+
+    _windows() {
+        const d = this._lastData;
+        const out = [];
+        for (const [key, title] of WINDOWS) {
+            const w = d?.[key];
+            if (w && w.utilization !== null && w.utilization !== undefined)
+                out.push({title, pct: w.utilization, resets_at: w.resets_at});
+        }
+        return out;
+    }
+
+    _setRow(row, w) {
+        if (!w) { row.visible = false; return; }
+        row.visible = true;
+        row.label.text =
+            `${w.title.padEnd(13, ' ')}${bar(w.pct)}  ${Math.round(w.pct)}%   ↻ ${resetHuman(w.resets_at)}`;
+    }
+
+    _render() {
+        const wins = this._windows();
+        const primary = wins[0];
+        if (primary) {
+            const pct = Math.max(0, Math.min(100, primary.pct ?? 0));
+            const color = severityColor(primary.pct);
+            this._fill.set_width(Math.round((TRACK_WIDTH * pct) / 100));
+            this._fill.style = `background-color: ${color}; border-radius: 5px;`;
+            this._pct.text = `${Math.round(primary.pct)}%`;
+            this._pct.style = `color: ${color};`;
+            this._header.label.text = 'Uso do Claude';
+        } else {
+            this._fill.set_width(0);
+            this._pct.text = this._lastError ? '⚠' : '…';
+            this._pct.style = '';
+            this._header.label.text = this._lastError || 'A carregar…';
+        }
+        this._setRow(this._row5h, wins[0]);
+        this._setRow(this._rowWeek, wins[1]);
+        this._setRow(this._rowOpus, wins[2]);
+    }
+});
+
+export default class ClaudeUsageExtension extends Extension {
+    enable() {
+        this._indicator = new ClaudeIndicator(this.path);
+        // posição 1 no caixote ESQUERDO (logo a seguir a "Atividades"); o Codex
+        // fica na posição 2, por isso ficam lado a lado.
+        Main.panel.addToStatusArea('claude-usage', this._indicator, 1, 'left');
+        this._indicator.refresh();
+        this._timer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, POLL_SECONDS, () => {
+            this._indicator?.refresh();
+            return GLib.SOURCE_CONTINUE;
+        });
+    }
+
+    disable() {
+        if (this._timer) {
+            GLib.Source.remove(this._timer);
+            this._timer = null;
+        }
+        this._indicator?.destroy();
+        this._indicator = null;
+    }
+}

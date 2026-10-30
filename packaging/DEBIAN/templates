@@ -1,0 +1,10 @@
+Template: claude-codex-usage/extensions
+Type: multiselect
+Choices: Claude, Codex
+Default: Claude, Codex
+Description: Indicadores de uso a instalar:
+ Escolha quais as extensoes do GNOME Shell a instalar e ativar. Pode
+ selecionar apenas o Claude, apenas o Codex, ou ambos.
+ .
+ No ecra de selecao use ESPACO para marcar/desmarcar cada opcao e ENTER
+ para confirmar.

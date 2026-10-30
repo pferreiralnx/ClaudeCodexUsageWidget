@@ -1,0 +1,21 @@
+.ai-usage-indicator {
+    spacing: 6px;
+    padding: 0 6px;
+}
+
+.ai-usage-logo {
+    margin-right: 2px;
+}
+
+.ai-usage-track {
+    background-color: rgba(255, 255, 255, 0.18);
+    border-radius: 5px;
+}
+
+.ai-usage-fill {
+    border-radius: 5px;
+}
+
+.ai-usage-pct {
+    min-width: 2.4em;
+}

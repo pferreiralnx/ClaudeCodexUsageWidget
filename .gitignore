@@ -1,0 +1,6 @@
+# Artefactos de build do .deb
+/build/
+
+# Python
+__pycache__/
+*.pyc

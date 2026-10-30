@@ -1,0 +1,17 @@
+Package: claude-codex-usage
+Version: 1.0.0
+Architecture: all
+Maintainer: Pedro Ferreira <https://pferreira.tech>
+Section: gnome
+Priority: optional
+Depends: gnome-shell, gir1.2-soup-3.0
+Recommends: gnome-shell-extension-manager
+Installed-Size: @SIZE@
+Description: Indicadores de uso do Claude e/ou Codex para o GNOME Shell
+ Extensoes do GNOME Shell que mostram, na barra de topo, uma barra de
+ progresso do uso do Claude (Anthropic) e/ou do Codex (OpenAI), com a
+ percentagem da sessao de 5h e um menu com os limites e o tempo ate ao
+ reset.
+ .
+ Ao instalar pode escolher instalar o indicador do Claude, o do Codex,
+ ou ambos.

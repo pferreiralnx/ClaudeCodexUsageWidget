@@ -1,0 +1,11 @@
+#!/bin/sh
+# Pre-configuracao: usado pelo apt (dpkg-preconfigure) para perguntar, ANTES de
+# instalar, quais os indicadores a instalar. Com "dpkg -i" esta pergunta e feita
+# no postinst (ver postinst), por isso funciona nos dois casos.
+set -e
+. /usr/share/debconf/confmodule
+
+db_input high claude-codex-usage/extensions || true
+db_go || true
+
+exit 0

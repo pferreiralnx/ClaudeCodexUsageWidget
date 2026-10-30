@@ -1,0 +1,7 @@
+{
+  "uuid": "codex-usage@local",
+  "name": "Codex Usage",
+  "description": "Barra de progresso do uso do Codex (OpenAI) no lado esquerdo da barra de topo. Mostra a sessão de 5h; ao clicar vê sessão e semanal com tempo até ao reset.",
+  "shell-version": ["45", "46", "47", "48"],
+  "version": 1
+}
