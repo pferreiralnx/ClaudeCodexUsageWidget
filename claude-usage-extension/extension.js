@@ -72,6 +72,9 @@ class ClaudeIndicator extends PanelMenu.Button {
         this._session = new Soup.Session();
         this._lastData = null;
         this._lastError = null;
+        this._failCount = 0;    // falhas consecutivas desde o último sucesso
+        this._inFlight = false; // há um pedido a decorrer? (evita 429 auto-infligidos)
+        this._retrySource = 0;  // id do timer de recuperação rápida
 
         const box = new St.BoxLayout({
             style_class: 'ai-usage-indicator',
@@ -125,10 +128,39 @@ class ClaudeIndicator extends PanelMenu.Button {
         refresh.connect('activate', () => this.refresh());
         this.menu.addMenuItem(refresh);
 
-        this.connect('destroy', () => { this._destroyed = true; });
+        this.connect('destroy', () => {
+            this._destroyed = true;
+            if (this._retrySource) { GLib.Source.remove(this._retrySource); this._retrySource = 0; }
+        });
+    }
+
+    // Falha recuperável: mantém o último valor bom na barra (não a apaga) e tenta
+    // outra vez daqui a poucos segundos. O endpoint /oauth/usage devolve 429 quando
+    // é consultado em rajada (o próprio Claude Code também o consulta), por isso uma
+    // falha pontual não deve deitar fora os dados que já tínhamos. Só limpamos os
+    // dados — mostrando ⚠ — em erros persistentes de credenciais/autenticação.
+    _softError(message, clearData = false) {
+        this._lastError = message;
+        this._failCount++;
+        if (clearData && this._failCount > 2) this._lastData = null;
+        this._render();
+        if (this._failCount <= 5)
+            this._scheduleRetry(Math.min(30, 6 * this._failCount));
+    }
+
+    _scheduleRetry(seconds) {
+        if (this._destroyed || this._retrySource) return;
+        this._retrySource = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, seconds, () => {
+            this._retrySource = 0;
+            if (this._destroyed) return GLib.SOURCE_REMOVE;
+            this.refresh();
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
     refresh() {
+        if (this._inFlight) return; // não sobrepor pedidos (evita 429 auto-infligidos)
+
         let token;
         try {
             const [, bytes] = GLib.file_get_contents(CREDS_PATH);
@@ -136,9 +168,9 @@ class ClaudeIndicator extends PanelMenu.Button {
             token = creds?.claudeAiOauth?.accessToken;
             if (!token) throw new Error('sem token');
         } catch (_e) {
-            this._lastData = null;
-            this._lastError = 'Sem credenciais — inicia sessão no Claude Code.';
-            this._render();
+            // Pode ser transitório: o Claude Code reescreve o ficheiro ao renovar o
+            // token e podemos apanhá-lo a meio. Mantém a barra e tenta outra vez.
+            this._softError('Sem credenciais — inicia sessão no Claude Code.', true);
             return;
         }
 
@@ -150,26 +182,29 @@ class ClaudeIndicator extends PanelMenu.Button {
         h.append('User-Agent', 'claude-usage-gnome/1.0');
         h.append('Accept', 'application/json');
 
+        this._inFlight = true;
         this._session.send_and_read_async(msg, GLib.PRIORITY_DEFAULT, null, (session, res) => {
+            this._inFlight = false;
             if (this._destroyed) return;
             try {
                 const b = session.send_and_read_finish(res);
                 const status = msg.get_status();
-                if (status !== Soup.Status.OK) {
-                    this._lastData = null;
-                    this._lastError = (status === 401 || status === 403)
-                        ? 'Sessão expirada — reautentica no Claude Code.'
-                        : `Erro HTTP ${status}`;
+                if (status === Soup.Status.OK) {
+                    this._lastData = JSON.parse(new TextDecoder().decode(b.get_data()));
+                    this._lastError = null;
+                    this._failCount = 0;
                     this._render();
                     return;
                 }
-                this._lastData = JSON.parse(new TextDecoder().decode(b.get_data()));
-                this._lastError = null;
-                this._render();
+                if (status === 401 || status === 403) {
+                    // Pode ser o token a ser renovado; só surge ⚠ se persistir.
+                    this._softError('Sessão expirada — reautentica no Claude Code.', true);
+                    return;
+                }
+                // 429 (rate limit) ou 5xx — transitório. Mantém o último valor bom.
+                this._softError(`Erro HTTP ${status}`, false);
             } catch (e) {
-                this._lastData = null;
-                this._lastError = `Falha: ${e.message}`;
-                this._render();
+                this._softError(`Falha: ${e.message}`, false);
             }
         });
     }
@@ -202,7 +237,11 @@ class ClaudeIndicator extends PanelMenu.Button {
             this._fill.style = `background-color: ${color}; border-radius: 5px;`;
             this._pct.text = `${Math.round(primary.pct)}%`;
             this._pct.style = `color: ${color};`;
-            this._header.label.text = 'Uso do Claude';
+            // Mantemos a barra com o último valor bom; se a última atualização
+            // falhou, avisamos no menu sem apagar a barra do painel.
+            this._header.label.text = this._lastError
+                ? `Uso do Claude · desatualizado (${this._lastError})`
+                : 'Uso do Claude';
         } else {
             this._fill.set_width(0);
             this._pct.text = this._lastError ? '⚠' : '…';
