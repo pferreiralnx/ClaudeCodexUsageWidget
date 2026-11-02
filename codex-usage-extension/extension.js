@@ -57,6 +57,8 @@ class CodexIndicator extends PanelMenu.Button {
         this._failCount = 0;    // falhas consecutivas desde o último sucesso
         this._inFlight = false; // há um pedido a decorrer? (evita pedidos sobrepostos)
         this._retrySource = 0;  // id do timer de recuperação rápida
+        this._rateLimitHits = 0; // 429 seguidos
+        this._backoffUntil = 0;  // até quando (tempo monotónico, µs) não consultar
 
         const box = new St.BoxLayout({
             style_class: 'ai-usage-indicator',
@@ -105,7 +107,7 @@ class CodexIndicator extends PanelMenu.Button {
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
         const refresh = new PopupMenu.PopupMenuItem('Atualizar agora');
-        refresh.connect('activate', () => this.refresh());
+        refresh.connect('activate', () => this.refresh(true));
         this.menu.addMenuItem(refresh);
 
         this.connect('destroy', () => {
@@ -118,13 +120,22 @@ class CodexIndicator extends PanelMenu.Button {
     // outra vez daqui a poucos segundos. Uma falha pontual de rede ou um 429 não
     // deve deitar fora os dados que já tínhamos. Só limpamos os dados — mostrando
     // ⚠ — em erros persistentes de credenciais/autenticação.
-    _softError(message, clearData = false) {
+    _softError(message, clearData = false, retry = true) {
         this._lastError = message;
         this._failCount++;
         if (clearData && this._failCount > 2) this._lastData = null;
         this._render();
-        if (this._failCount <= 5)
+        if (retry && this._failCount <= 5)
             this._scheduleRetry(Math.min(30, 6 * this._failCount));
+    }
+
+    // 429: tentar logo outra vez só prolonga o bloqueio. Sem nova tentativa rápida
+    // e as consultas periódicas passam a ser espaçadas (3m, 6m, 12m, 15m…).
+    _rateLimited() {
+        this._rateLimitHits++;
+        const wait = Math.min(900, POLL_SECONDS * 2 ** this._rateLimitHits);
+        this._backoffUntil = GLib.get_monotonic_time() + wait * 1e6;
+        this._softError(`Limite de pedidos (429) — nova tentativa em ${human(wait)}`, false, false);
     }
 
     _scheduleRetry(seconds) {
@@ -137,8 +148,10 @@ class CodexIndicator extends PanelMenu.Button {
         });
     }
 
-    refresh() {
+    // force = pedido manual ("Atualizar agora"), que ignora a espera após um 429.
+    refresh(force = false) {
         if (this._inFlight) return; // não sobrepor pedidos
+        if (!force && GLib.get_monotonic_time() < this._backoffUntil) return;
 
         let token, account;
         try {
@@ -168,11 +181,15 @@ class CodexIndicator extends PanelMenu.Button {
             if (this._destroyed) return;
             try {
                 const b = session.send_and_read_finish(res);
-                const status = msg.get_status();
-                if (status === Soup.Status.OK) {
+                // status_code é um número simples; get_status() devolve o enum
+                // Soup.Status, que não tem o 429 e rebenta ao convertê-lo.
+                const status = msg.status_code;
+                if (status === 200) {
                     this._lastData = JSON.parse(new TextDecoder().decode(b.get_data()));
                     this._lastError = null;
                     this._failCount = 0;
+                    this._rateLimitHits = 0;
+                    this._backoffUntil = 0;
                     this._render();
                     return;
                 }
@@ -181,7 +198,11 @@ class CodexIndicator extends PanelMenu.Button {
                     this._softError('Sessão expirada — reautentica no Codex.', true);
                     return;
                 }
-                // 429 (rate limit) ou 5xx — transitório. Mantém o último valor bom.
+                if (status === 429) {
+                    this._rateLimited();
+                    return;
+                }
+                // 5xx — transitório. Mantém o último valor bom.
                 this._softError(`Erro HTTP ${status}`, false);
             } catch (e) {
                 this._softError(`Falha: ${e.message}`, false);
