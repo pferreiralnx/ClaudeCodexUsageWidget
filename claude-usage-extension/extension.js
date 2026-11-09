@@ -77,6 +77,8 @@ class ClaudeIndicator extends PanelMenu.Button {
         this._retrySource = 0;  // id do timer de recuperação rápida
         this._rateLimitHits = 0; // 429 seguidos
         this._backoffUntil = 0;  // até quando (tempo monotónico, µs) não consultar
+        this._expired = false;   // token expirado, à espera que o Claude Code o renove
+        this._credsSource = 0;   // id do timer que reage a mudanças nas credenciais
 
         const box = new St.BoxLayout({
             style_class: 'ai-usage-indicator',
@@ -130,9 +132,25 @@ class ClaudeIndicator extends PanelMenu.Button {
         refresh.connect('activate', () => this.refresh(true));
         this.menu.addMenuItem(refresh);
 
+        // Com o PC desligado o token expira (dura ~8h) e só o Claude Code o renova,
+        // reescrevendo este ficheiro. Se estivermos parados num erro, atualiza logo
+        // que o ficheiro mude, em vez de esperar pela próxima consulta.
+        this._credsMonitor = Gio.File.new_for_path(CREDS_PATH)
+            .monitor_file(Gio.FileMonitorFlags.NONE, null);
+        this._credsMonitor.connect('changed', () => {
+            if (!this._lastError || this._credsSource) return;
+            this._credsSource = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 2, () => {
+                this._credsSource = 0;
+                if (!this._destroyed) this.refresh();
+                return GLib.SOURCE_REMOVE;
+            });
+        });
+
         this.connect('destroy', () => {
             this._destroyed = true;
             if (this._retrySource) { GLib.Source.remove(this._retrySource); this._retrySource = 0; }
+            if (this._credsSource) { GLib.Source.remove(this._credsSource); this._credsSource = 0; }
+            this._credsMonitor.cancel();
         });
     }
 
@@ -142,7 +160,9 @@ class ClaudeIndicator extends PanelMenu.Button {
     // falha pontual não deve deitar fora os dados que já tínhamos. Só limpamos os
     // dados — mostrando ⚠ — em erros persistentes de credenciais/autenticação.
     _softError(message, clearData = false, retry = true) {
+        console.warn(`claude-usage: ${message}`);
         this._lastError = message;
+        this._expired = false;
         this._failCount++;
         if (clearData && this._failCount > 2) this._lastData = null;
         this._render();
@@ -157,6 +177,15 @@ class ClaudeIndicator extends PanelMenu.Button {
         const wait = Math.min(900, POLL_SECONDS * 2 ** this._rateLimitHits);
         this._backoffUntil = GLib.get_monotonic_time() + wait * 1e6;
         this._softError(`Limite de pedidos (429) — nova tentativa em ${human(wait)}`, false, false);
+    }
+
+    // Token expirado não é falha nossa: não consulta o endpoint (seria um 401 certo)
+    // e fica à espera, sem ⚠, até o Claude Code o renovar (ver _credsMonitor).
+    _tokenExpired() {
+        if (!this._expired) console.warn('claude-usage: token expirado, à espera do Claude Code');
+        this._lastError = 'Token expirado — abre o Claude Code para o renovar.';
+        this._expired = true;
+        this._render();
     }
 
     _scheduleRetry(seconds) {
@@ -174,16 +203,21 @@ class ClaudeIndicator extends PanelMenu.Button {
         if (this._inFlight) return; // não sobrepor pedidos (evita 429 auto-infligidos)
         if (!force && GLib.get_monotonic_time() < this._backoffUntil) return;
 
-        let token;
+        let token, expiresAt;
         try {
             const [, bytes] = GLib.file_get_contents(CREDS_PATH);
             const creds = JSON.parse(new TextDecoder().decode(bytes));
             token = creds?.claudeAiOauth?.accessToken;
+            expiresAt = creds?.claudeAiOauth?.expiresAt; // ms
             if (!token) throw new Error('sem token');
         } catch (_e) {
             // Pode ser transitório: o Claude Code reescreve o ficheiro ao renovar o
             // token e podemos apanhá-lo a meio. Mantém a barra e tenta outra vez.
             this._softError('Sem credenciais — inicia sessão no Claude Code.', true);
+            return;
+        }
+        if (expiresAt && expiresAt <= Date.now()) {
+            this._tokenExpired();
             return;
         }
 
@@ -207,6 +241,7 @@ class ClaudeIndicator extends PanelMenu.Button {
                 if (status === 200) {
                     this._lastData = JSON.parse(new TextDecoder().decode(b.get_data()));
                     this._lastError = null;
+                    this._expired = false;
                     this._failCount = 0;
                     this._rateLimitHits = 0;
                     this._backoffUntil = 0;
@@ -265,7 +300,7 @@ class ClaudeIndicator extends PanelMenu.Button {
                 : 'Uso do Claude';
         } else {
             this._fill.set_width(0);
-            this._pct.text = this._lastError ? '⚠' : '…';
+            this._pct.text = this._expired ? '—' : this._lastError ? '⚠' : '…';
             this._pct.style = '';
             this._header.label.text = this._lastError || 'A carregar…';
         }

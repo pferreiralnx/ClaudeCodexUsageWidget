@@ -46,6 +46,17 @@ function human(seconds) {
     return `${m}m`;
 }
 
+// O auth.json não guarda a validade à parte: vem no campo "exp" (segundos) do JWT.
+function jwtExp(token) {
+    try {
+        let p = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+        p += '='.repeat((4 - (p.length % 4)) % 4);
+        return JSON.parse(new TextDecoder().decode(GLib.base64_decode(p))).exp ?? null;
+    } catch (_e) {
+        return null;
+    }
+}
+
 const CodexIndicator = GObject.registerClass(
 class CodexIndicator extends PanelMenu.Button {
     _init(extPath) {
@@ -59,6 +70,8 @@ class CodexIndicator extends PanelMenu.Button {
         this._retrySource = 0;  // id do timer de recuperação rápida
         this._rateLimitHits = 0; // 429 seguidos
         this._backoffUntil = 0;  // até quando (tempo monotónico, µs) não consultar
+        this._expired = false;   // token expirado, à espera que o Codex o renove
+        this._authSource = 0;    // id do timer que reage a mudanças no auth.json
 
         const box = new St.BoxLayout({
             style_class: 'ai-usage-indicator',
@@ -110,9 +123,25 @@ class CodexIndicator extends PanelMenu.Button {
         refresh.connect('activate', () => this.refresh(true));
         this.menu.addMenuItem(refresh);
 
+        // Com o PC desligado o token pode expirar e só o Codex o renova, reescrevendo
+        // este ficheiro. Se estivermos parados num erro, atualiza logo que o ficheiro
+        // mude, em vez de esperar pela próxima consulta.
+        this._authMonitor = Gio.File.new_for_path(AUTH_PATH)
+            .monitor_file(Gio.FileMonitorFlags.NONE, null);
+        this._authMonitor.connect('changed', () => {
+            if (!this._lastError || this._authSource) return;
+            this._authSource = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 2, () => {
+                this._authSource = 0;
+                if (!this._destroyed) this.refresh();
+                return GLib.SOURCE_REMOVE;
+            });
+        });
+
         this.connect('destroy', () => {
             this._destroyed = true;
             if (this._retrySource) { GLib.Source.remove(this._retrySource); this._retrySource = 0; }
+            if (this._authSource) { GLib.Source.remove(this._authSource); this._authSource = 0; }
+            this._authMonitor.cancel();
         });
     }
 
@@ -121,7 +150,9 @@ class CodexIndicator extends PanelMenu.Button {
     // deve deitar fora os dados que já tínhamos. Só limpamos os dados — mostrando
     // ⚠ — em erros persistentes de credenciais/autenticação.
     _softError(message, clearData = false, retry = true) {
+        console.warn(`codex-usage: ${message}`);
         this._lastError = message;
+        this._expired = false;
         this._failCount++;
         if (clearData && this._failCount > 2) this._lastData = null;
         this._render();
@@ -136,6 +167,15 @@ class CodexIndicator extends PanelMenu.Button {
         const wait = Math.min(900, POLL_SECONDS * 2 ** this._rateLimitHits);
         this._backoffUntil = GLib.get_monotonic_time() + wait * 1e6;
         this._softError(`Limite de pedidos (429) — nova tentativa em ${human(wait)}`, false, false);
+    }
+
+    // Token expirado não é falha nossa: não consulta o endpoint (seria um 401 certo)
+    // e fica à espera, sem ⚠, até o Codex o renovar (ver _authMonitor).
+    _tokenExpired() {
+        if (!this._expired) console.warn('codex-usage: token expirado, à espera do Codex');
+        this._lastError = 'Token expirado — abre o Codex para o renovar.';
+        this._expired = true;
+        this._render();
     }
 
     _scheduleRetry(seconds) {
@@ -166,6 +206,11 @@ class CodexIndicator extends PanelMenu.Button {
             this._softError('Sem credenciais — inicia sessão no Codex.', true);
             return;
         }
+        const exp = jwtExp(token);
+        if (exp && exp * 1000 <= Date.now()) {
+            this._tokenExpired();
+            return;
+        }
 
         const msg = Soup.Message.new('GET', USAGE_URL);
         const h = msg.get_request_headers();
@@ -187,6 +232,7 @@ class CodexIndicator extends PanelMenu.Button {
                 if (status === 200) {
                     this._lastData = JSON.parse(new TextDecoder().decode(b.get_data()));
                     this._lastError = null;
+                    this._expired = false;
                     this._failCount = 0;
                     this._rateLimitHits = 0;
                     this._backoffUntil = 0;
@@ -253,7 +299,7 @@ class CodexIndicator extends PanelMenu.Button {
                 : `Uso do Codex${plan ? ' · ' + plan : ''}`;
         } else {
             this._fill.set_width(0);
-            this._pct.text = this._lastError ? '⚠' : '…';
+            this._pct.text = this._expired ? '—' : this._lastError ? '⚠' : '…';
             this._pct.style = '';
             this._header.label.text = this._lastError || 'A carregar…';
         }
